@@ -39,9 +39,9 @@ function todayStr(): string {
 }
 
 function addOneDay(dateStr: string): string {
-  const d = new Date(dateStr + 'T00:00:00')
-  d.setDate(d.getDate() + 1)
-  return d.toISOString().slice(0, 10)
+  const [y, m, d] = dateStr.split('-').map(Number)
+  const next = new Date(Date.UTC(y, m - 1, d + 1))
+  return next.toISOString().slice(0, 10)
 }
 
 // POST /transactions — create transaction with items
@@ -223,6 +223,128 @@ router.get('/transactions/today', async (req: Request, res: Response) => {
     transactions: transactionsWithItems,
     totalRevenue: Number(summary.totalRevenue),
     count: Number(summary.count),
+  })
+})
+
+const listQuerySchema = z.object({
+  startDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD')
+    .optional(),
+  endDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD')
+    .optional(),
+  paymentMethod: z.enum(['CASH', 'QRIS']).optional(),
+  search: z.string().optional(),
+  page: z
+    .string()
+    .regex(/^\d+$/, 'page must be a positive integer')
+    .optional(),
+  limit: z
+    .string()
+    .regex(/^\d+$/, 'limit must be a positive integer')
+    .optional(),
+})
+
+// GET /transactions — paginated list with search
+router.get('/transactions', async (req: Request, res: Response) => {
+  const parsed = listQuerySchema.safeParse(req.query)
+  if (!parsed.success) {
+    return res.status(400).json({ message: parsed.error.issues[0].message })
+  }
+
+  const startDate = parsed.data.startDate ?? todayStr()
+  const endDate = parsed.data.endDate ?? todayStr()
+  const endDateExclusive = addOneDay(endDate)
+  const paymentMethod = parsed.data.paymentMethod
+  const search = parsed.data.search?.trim() || undefined
+  const page = Math.max(1, Number(parsed.data.page) || 1)
+  const limit = Math.min(100, Math.max(1, Number(parsed.data.limit) || 20))
+  const offset = (page - 1) * limit
+
+  const conditions: string[] = ['t.created_at >= $1', 't.created_at < $2']
+  const params: (string | number)[] = [startDate, endDateExclusive]
+  let paramIdx = 3
+
+  if (paymentMethod) {
+    conditions.push(`t.payment_method = $${paramIdx++}`)
+    params.push(paymentMethod)
+  }
+
+  if (search) {
+    conditions.push(
+      `(t.id ILIKE $${paramIdx} OR t.id IN (SELECT ti.transaction_id FROM transaction_items ti JOIN products p ON p.id = ti.product_id WHERE p.name ILIKE $${paramIdx}))`,
+    )
+    params.push(`%${search}%`)
+    paramIdx++
+  }
+
+  const whereClause = conditions.join(' AND ')
+
+  // Count total matching rows
+  const countResult = await db.query(
+    `SELECT COUNT(*) AS "totalCount", COALESCE(SUM(t.total_amount), 0) AS "totalRevenue"
+     FROM transactions t
+     WHERE ${whereClause}`,
+    params,
+  )
+
+  const totalCount = Number(countResult.rows[0].totalCount)
+  const totalRevenue = Number(countResult.rows[0].totalRevenue)
+  const totalPages = Math.ceil(totalCount / limit)
+
+  // Fetch page of transactions (without items)
+  const txResult = await db.query(
+    `SELECT t.id, t.cashier_id AS "cashierId", t.total_amount AS "totalAmount",
+            t.payment_method AS "paymentMethod", t.amount_tendered AS "amountTendered",
+            t.created_at AS "createdAt"
+     FROM transactions t
+     WHERE ${whereClause}
+     ORDER BY t.created_at DESC
+     LIMIT $${paramIdx++} OFFSET $${paramIdx++}`,
+    [...params, limit, offset],
+  )
+
+  const transactions = txResult.rows as Array<{
+    id: string
+    cashierId: string
+    totalAmount: number
+    paymentMethod: string
+    amountTendered: number | null
+    createdAt: string
+  }>
+
+  // Attach items to each transaction
+  const transactionsWithItems = []
+  for (const tx of transactions) {
+    const itemsResult = await db.query(
+      `SELECT
+        ti.id,
+        ti.product_id AS "productId",
+        p.name AS "productName",
+        ti.quantity,
+        ti.unit_price AS "unitPrice"
+       FROM transaction_items ti
+       LEFT JOIN products p ON p.id = ti.product_id
+       WHERE ti.transaction_id = $1`,
+      [tx.id],
+    )
+
+    transactionsWithItems.push({
+      ...tx,
+      amountTendered: tx.amountTendered ?? undefined,
+      items: itemsResult.rows,
+    })
+  }
+
+  res.json({
+    transactions: transactionsWithItems,
+    totalCount,
+    totalRevenue,
+    page,
+    limit,
+    totalPages,
   })
 })
 
