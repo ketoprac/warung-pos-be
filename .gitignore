@@ -9,11 +9,6 @@ dist/
 .env.*
 !.env.example
 
-# Database (SQLite)
-*.db
-*.sqlite
-*.sqlite3
-
 # Logs
 logs/
 *.log

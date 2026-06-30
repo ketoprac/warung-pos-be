@@ -22,8 +22,30 @@ const createSchema = z.object({
     .min(1, 'At least one item is required'),
 })
 
+const querySchema = z.object({
+  startDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'startDate must be YYYY-MM-DD')
+    .optional(),
+  endDate: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/, 'endDate must be YYYY-MM-DD')
+    .optional(),
+  paymentMethod: z.enum(['CASH', 'QRIS']).optional(),
+})
+
+function todayStr(): string {
+  return new Date().toISOString().slice(0, 10)
+}
+
+function addOneDay(dateStr: string): string {
+  const d = new Date(dateStr + 'T00:00:00')
+  d.setDate(d.getDate() + 1)
+  return d.toISOString().slice(0, 10)
+}
+
 // POST /transactions — create transaction with items
-router.post('/transactions', (req: Request, res: Response) => {
+router.post('/transactions', async (req: Request, res: Response) => {
   const parsed = createSchema.safeParse(req.body)
   if (!parsed.success) {
     return res.status(400).json({ message: parsed.error.issues[0].message })
@@ -42,26 +64,21 @@ router.post('/transactions', (req: Request, res: Response) => {
   const txId = randomUUID()
   const cashierId = req.user!.userId
 
-  const insertTx = db.prepare(
-    `INSERT INTO transactions (id, cashier_id, total_amount, payment_method, amount_tendered)
-     VALUES (?, ?, ?, ?, ?)`,
-  )
+  const client = await db.connect()
 
-  const insertItem = db.prepare(
-    `INSERT INTO transaction_items (id, transaction_id, product_id, quantity, unit_price)
-     VALUES (?, ?, ?, ?, ?)`,
-  )
+  try {
+    await client.query('BEGIN')
 
-  const getProductName = db.prepare('SELECT name FROM products WHERE id = ?')
-
-  // Use a transaction for atomicity
-  const createAll = db.transaction(() => {
-    insertTx.run(
-      txId,
-      cashierId,
-      totalAmount,
-      paymentMethod,
-      paymentMethod === 'CASH' ? amountTendered : null,
+    await client.query(
+      `INSERT INTO transactions (id, cashier_id, total_amount, payment_method, amount_tendered)
+       VALUES ($1, $2, $3, $4, $5)`,
+      [
+        txId,
+        cashierId,
+        totalAmount,
+        paymentMethod,
+        paymentMethod === 'CASH' ? amountTendered : null,
+      ],
     )
 
     const savedItems: Array<{
@@ -74,49 +91,93 @@ router.post('/transactions', (req: Request, res: Response) => {
 
     for (const item of items) {
       const itemId = randomUUID()
-      insertItem.run(itemId, txId, item.productId, item.qty, item.price)
+      await client.query(
+        `INSERT INTO transaction_items (id, transaction_id, product_id, quantity, unit_price)
+         VALUES ($1, $2, $3, $4, $5)`,
+        [itemId, txId, item.productId, item.qty, item.price],
+      )
 
-      const prod = getProductName.get(item.productId) as { name: string } | undefined
+      const prodResult = await client.query('SELECT name FROM products WHERE id = $1', [
+        item.productId,
+      ])
+
       savedItems.push({
         id: itemId,
         productId: item.productId,
-        productName: prod?.name ?? 'Unknown',
+        productName: prodResult.rows[0]?.name ?? 'Unknown',
         quantity: item.qty,
         unitPrice: item.price,
       })
     }
 
-    return savedItems
-  })
+    await client.query('COMMIT')
 
-  const savedItems = createAll()
-
-  res.status(201).json({
-    id: txId,
-    cashierId,
-    totalAmount,
-    paymentMethod,
-    amountTendered: paymentMethod === 'CASH' ? amountTendered : undefined,
-    createdAt: new Date().toISOString(),
-    items: savedItems,
-  })
+    res.status(201).json({
+      id: txId,
+      cashierId,
+      totalAmount,
+      paymentMethod,
+      amountTendered: paymentMethod === 'CASH' ? amountTendered : undefined,
+      createdAt: new Date().toISOString(),
+      items: savedItems,
+    })
+  } catch (err) {
+    await client.query('ROLLBACK')
+    throw err
+  } finally {
+    client.release()
+  }
 })
 
-// GET /transactions/today — daily summary
-router.get('/transactions/today', (_req: Request, res: Response) => {
-  const today = new Date()
-  const startOfDay = today.toISOString().slice(0, 10) // "2026-06-26"
+// GET /transactions/today — daily summary with optional filters
+router.get('/transactions/today', async (req: Request, res: Response) => {
+  const hasFilters =
+    req.query.startDate !== undefined ||
+    req.query.endDate !== undefined ||
+    req.query.paymentMethod !== undefined
 
-  const transactions = db
-    .prepare(
-      `SELECT id, cashier_id AS cashierId, total_amount AS totalAmount,
-              payment_method AS paymentMethod, amount_tendered AS amountTendered,
-              created_at AS createdAt
-       FROM transactions
-       WHERE created_at >= ?
-       ORDER BY created_at DESC`,
-    )
-    .all(startOfDay) as Array<{
+  let startDate: string
+  let endDate: string
+  let paymentMethod: string | undefined
+
+  if (hasFilters) {
+    const parsed = querySchema.safeParse(req.query)
+    if (!parsed.success) {
+      return res.status(400).json({ message: parsed.error.issues[0].message })
+    }
+    startDate = parsed.data.startDate ?? todayStr()
+    endDate = parsed.data.endDate ?? todayStr()
+    paymentMethod = parsed.data.paymentMethod
+  } else {
+    startDate = todayStr()
+    endDate = todayStr()
+    paymentMethod = undefined
+  }
+
+  const endDateExclusive = addOneDay(endDate)
+
+  const conditions: string[] = ['created_at >= $1', 'created_at < $2']
+  const params: (string | number)[] = [startDate, endDateExclusive]
+  let paramIdx = 3
+
+  if (paymentMethod) {
+    conditions.push(`payment_method = $${paramIdx++}`)
+    params.push(paymentMethod)
+  }
+
+  const whereClause = conditions.join(' AND ')
+
+  const txResult = await db.query(
+    `SELECT id, cashier_id AS "cashierId", total_amount AS "totalAmount",
+            payment_method AS "paymentMethod", amount_tendered AS "amountTendered",
+            created_at AS "createdAt"
+     FROM transactions
+     WHERE ${whereClause}
+     ORDER BY created_at DESC`,
+    params,
+  )
+
+  const transactions = txResult.rows as Array<{
     id: string
     cashierId: string
     totalAmount: number
@@ -125,39 +186,43 @@ router.get('/transactions/today', (_req: Request, res: Response) => {
     createdAt: string
   }>
 
-  // Fetch items for each transaction
-  const getItems = db.prepare(
+  const transactionsWithItems = []
+  for (const tx of transactions) {
+    const itemsResult = await db.query(
+      `SELECT
+        ti.id,
+        ti.product_id AS "productId",
+        p.name AS "productName",
+        ti.quantity,
+        ti.unit_price AS "unitPrice"
+       FROM transaction_items ti
+       LEFT JOIN products p ON p.id = ti.product_id
+       WHERE ti.transaction_id = $1`,
+      [tx.id],
+    )
+
+    transactionsWithItems.push({
+      ...tx,
+      amountTendered: tx.amountTendered ?? undefined,
+      items: itemsResult.rows,
+    })
+  }
+
+  const summaryResult = await db.query(
     `SELECT
-      ti.id,
-      ti.product_id AS productId,
-      p.name AS productName,
-      ti.quantity,
-      ti.unit_price AS unitPrice
-     FROM transaction_items ti
-     LEFT JOIN products p ON p.id = ti.product_id
-     WHERE ti.transaction_id = ?`,
+      COALESCE(SUM(total_amount), 0) AS "totalRevenue",
+      COUNT(*) AS count
+     FROM transactions
+     WHERE ${whereClause}`,
+    params,
   )
 
-  const transactionsWithItems = transactions.map((tx) => ({
-    ...tx,
-    amountTendered: tx.amountTendered ?? undefined,
-    items: getItems.all(tx.id),
-  }))
-
-  const summary = db
-    .prepare(
-      `SELECT
-        COALESCE(SUM(total_amount), 0) AS totalRevenue,
-        COUNT(*) AS count
-       FROM transactions
-       WHERE created_at >= ?`,
-    )
-    .get(startOfDay) as { totalRevenue: number; count: number }
+  const summary = summaryResult.rows[0]
 
   res.json({
     transactions: transactionsWithItems,
-    totalRevenue: summary.totalRevenue,
-    count: summary.count,
+    totalRevenue: Number(summary.totalRevenue),
+    count: Number(summary.count),
   })
 })
 

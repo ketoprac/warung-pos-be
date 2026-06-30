@@ -1,11 +1,29 @@
-import db from './db.js'
+import 'dotenv/config'
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
+import { join, dirname } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import bcrypt from 'bcryptjs'
+import { Pool } from 'pg'
+
+const __dirname = dirname(fileURLToPath(import.meta.url))
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+})
+
+// Run schema first
+const schema = readFileSync(join(__dirname, 'schema.sql'), 'utf-8')
+await pool.query(schema)
+console.log('Schema initialized')
 
 // Only seed if no users exist
-const userCount = db.prepare('SELECT COUNT(*) as count FROM users').get() as { count: number }
-if (userCount.count > 0) {
+const userResult = await pool.query('SELECT COUNT(*) as count FROM users')
+const userCount = Number(userResult.rows[0].count)
+
+if (userCount > 0) {
   console.log('Database already seeded. Skipping.')
+  await pool.end()
   process.exit(0)
 }
 
@@ -16,28 +34,32 @@ const cashierId = randomUUID()
 const passwordHash = bcrypt.hashSync('password123', 10)
 
 // Insert users
-db.prepare(
-  'INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, ?)',
-).run(adminId, 'admin@warung.com', passwordHash, 'ADMIN')
+await pool.query(
+  'INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, $4)',
+  [adminId, 'admin@warung.com', passwordHash, 'ADMIN'],
+)
 
-db.prepare(
-  'INSERT INTO users (id, email, password_hash, role) VALUES (?, ?, ?, ?)',
-).run(cashierId, 'cashier@warung.com', passwordHash, 'CASHIER')
+await pool.query(
+  'INSERT INTO users (id, email, password_hash, role) VALUES ($1, $2, $3, $4)',
+  [cashierId, 'cashier@warung.com', passwordHash, 'CASHIER'],
+)
 
 console.log('  Created users: admin@warung.com, cashier@warung.com (password: password123)')
 
 // Insert categories
-const catResult = db.prepare('INSERT INTO categories (name) VALUES (?)')
-const drinksId = catResult.run('Drinks').lastInsertRowid as number
-const foodId = catResult.run('Food').lastInsertRowid as number
+const drinksResult = await pool.query(
+  "INSERT INTO categories (name) VALUES ('Drinks') RETURNING id",
+)
+const drinksId = drinksResult.rows[0].id
+
+const foodResult = await pool.query(
+  "INSERT INTO categories (name) VALUES ('Food') RETURNING id",
+)
+const foodId = foodResult.rows[0].id
 
 console.log(`  Created categories: Drinks (${drinksId}), Food (${foodId})`)
 
 // Insert sample products
-const insertProduct = db.prepare(
-  'INSERT INTO products (category_id, name, price) VALUES (?, ?, ?)',
-)
-
 const products = [
   [drinksId, 'Kopi Susu', 18000],
   [drinksId, 'Teh Manis', 8000],
@@ -50,10 +72,14 @@ const products = [
 ] as const
 
 for (const [catId, name, price] of products) {
-  insertProduct.run(catId, name, price)
+  await pool.query(
+    'INSERT INTO products (category_id, name, price) VALUES ($1, $2, $3)',
+    [catId, name, price],
+  )
 }
 
 console.log(`  Created ${products.length} products`)
 
 console.log('Seeding complete!')
+await pool.end()
 process.exit(0)

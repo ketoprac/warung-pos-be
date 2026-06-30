@@ -3,16 +3,16 @@ CREATE TABLE IF NOT EXISTS users (
   email TEXT UNIQUE NOT NULL,
   password_hash TEXT NOT NULL,
   role TEXT NOT NULL CHECK(role IN ('ADMIN', 'CASHIER')),
-  created_at TEXT DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS categories (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   name TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS products (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  id SERIAL PRIMARY KEY,
   category_id INTEGER NOT NULL REFERENCES categories(id),
   name TEXT NOT NULL,
   price INTEGER NOT NULL CHECK(price > 0),
@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS transactions (
   total_amount INTEGER NOT NULL,
   payment_method TEXT NOT NULL CHECK(payment_method IN ('CASH', 'QRIS')),
   amount_tendered INTEGER,
-  created_at TEXT DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS transaction_items (

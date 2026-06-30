@@ -11,7 +11,7 @@ const loginSchema = z.object({
   password: z.string().min(1, 'Password is required'),
 })
 
-router.post('/auth/login', (req: Request, res: Response) => {
+router.post('/auth/login', async (req: Request, res: Response) => {
   const parsed = loginSchema.safeParse(req.body)
   if (!parsed.success) {
     return res.status(400).json({ message: parsed.error.issues[0].message })
@@ -19,9 +19,14 @@ router.post('/auth/login', (req: Request, res: Response) => {
 
   const { email, password } = parsed.data
 
-  const user = db
-    .prepare('SELECT id, email, password_hash, role FROM users WHERE email = ?')
-    .get(email) as { id: string; email: string; password_hash: string; role: string } | undefined
+  const result = await db.query(
+    'SELECT id, email, password_hash, role FROM users WHERE email = $1',
+    [email],
+  )
+
+  const user = result.rows[0] as
+    | { id: string; email: string; password_hash: string; role: string }
+    | undefined
 
   if (!user || !bcrypt.compareSync(password, user.password_hash)) {
     return res.status(401).json({ message: 'Incorrect credentials' })
